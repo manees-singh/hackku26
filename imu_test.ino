@@ -45,7 +45,7 @@ void loop(void) {
       M5.Display.setRotation(currentRotation);
       M5.Display.fillScreen(TFT_WHITE); // Full clear ONLY on rotation change
       
-      // Draw static label once
+      // Draw static label oncerqwrtqwerqpwerqw;ajsdf a;sldkfja ;ldfj
       M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
       M5.Display.setTextSize(1);
       M5.Display.drawString(label, M5.Display.width() / 2, M5.Display.height() / 2 - 40);

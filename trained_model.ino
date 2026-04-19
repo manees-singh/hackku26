@@ -1,79 +1,112 @@
-#include <M5Stack.h>
-#include <guardyou_inferencing.h> // Your AI library
+#include <M5Unified.h>
+#include <guardyou_inferencing.h>
 
-// Settings
-#define CONVERT_G_TO_MS2    9.80665f
-static const bool debug_nn = false; 
+#define PICKUP_THRESHOLD 0.50f
+
+static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 
 void setup() {
-    M5.begin();
-    M5.Power.begin();
-    M5.IMU.Init(); // Initialize the M5GO's internal accelerometer
-    
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(GREEN);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setCursor(10, 10);
-    M5.Lcd.println("GUARDIAN ACTIVE");
-    M5.Lcd.println("Status: Stable");
+    auto cfg = M5.config();
+    M5.begin(cfg);
+    M5.Imu.begin();
+    Serial.begin(115200);
+
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextFont(&fonts::Font2);
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.drawString("Initializing...",
+        M5.Display.width() / 2,
+        M5.Display.height() / 2);
+
+    // Pre-fill entire buffer before first inference
+    size_t samples_required =
+        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+
+    for (size_t i = 0; i < samples_required; i++) {
+        M5.Imu.update();
+        auto imu = M5.Imu.getImuData();
+        size_t ix = i * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+        buffer[ix + 0] = imu.accel.x;
+        buffer[ix + 1] = imu.accel.y;
+        buffer[ix + 2] = imu.accel.z;
+        buffer[ix + 3] = imu.gyro.x;
+        buffer[ix + 4] = imu.gyro.y;
+        buffer[ix + 5] = imu.gyro.z;
+        delay(EI_CLASSIFIER_INTERVAL_MS);
+    }
 }
 
 void loop() {
-    // 1. Create a buffer to hold the 1.5s of data the AI expects
-    float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = { 0 };
+    size_t samples_required =
+        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
 
-    // 2. Fill the buffer with live data from the M5GO IMU
-    for (size_t ix = 0; ix < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; ix += EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME) {
-        int64_t next_tick = micros() + (EI_CLASSIFIER_INTERVAL_MS * 1000);
+    // Slide buffer left by 25% — drop oldest quarter of samples
+    size_t quarter = (samples_required / 4) * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+    memmove(buffer, buffer + quarter,
+            (EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE - quarter) * sizeof(float));
 
-        float ax, ay, az, gx, gy, gz;
-        M5.IMU.getAccelData(&ax, &ay, &az);
-        M5.IMU.getGyroData(&gx, &gy, &gz);
-
-        // Fill buffer (Must match the order you used in Edge Impulse: accX, accY, accZ, gyrX...)
-        buffer[ix + 0] = ax * CONVERT_G_TO_MS2;
-        buffer[ix + 1] = ay * CONVERT_G_TO_MS2;
-        buffer[ix + 2] = az * CONVERT_G_TO_MS2;
-        buffer[ix + 3] = gx;
-        buffer[ix + 4] = gy;
-        buffer[ix + 5] = gz;
-
-        int64_t wait_time = next_tick - micros();
-        if(wait_time > 0) delayMicroseconds(wait_time);
+    // Fill the last 25% with fresh samples
+    size_t fill_start = (samples_required * 3) / 4;
+    for (size_t i = fill_start; i < samples_required; i++) {
+        M5.Imu.update();
+        auto imu = M5.Imu.getImuData();
+        size_t ix = i * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+        buffer[ix + 0] = imu.accel.x;
+        buffer[ix + 1] = imu.accel.y;
+        buffer[ix + 2] = imu.accel.z;
+        buffer[ix + 3] = imu.gyro.x;
+        buffer[ix + 4] = imu.gyro.y;
+        buffer[ix + 5] = imu.gyro.z;
+        delay(EI_CLASSIFIER_INTERVAL_MS);
     }
 
-    // 3. Run the AI Classifier
+    // Run classifier
     signal_t signal;
-    numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+    numpy::signal_from_buffer(buffer,
+        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE,
+        &signal);
+
     ei_impulse_result_t result = { 0 };
-    run_classifier(&signal, &result, debug_nn);
+    run_classifier(&signal, &result, false);
 
-    // 4. Logic: What to do if the phone is stolen?
-    // Based on your 100% accuracy, 'pickup' is at index [0] or [1]
-    // Check Serial Monitor to see which index 'pickup' is!
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        if (strcmp(result.classification[ix].label, "pickup") == 0) {
-            if (result.classification[ix].value > 0.85) {
-                triggerAlarm();
-            } else {
-                resetDisplay();
-            }
-        }
+    // Get scores
+    float idle_score = 0.0f;
+    float stable_score = 0.0f;
+
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        String label = String(ei_classifier_inferencing_categories[i]);
+        if (label == "idle")   idle_score   = result.classification[i].value;
+        if (label == "stable") stable_score = result.classification[i].value;
+
+        Serial.print(label);
+        Serial.print(": ");
+        Serial.println(result.classification[i].value, 4);
     }
-}
+    Serial.println("---");
 
-void triggerAlarm() {
-    M5.Lcd.fillScreen(RED);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.setCursor(60, 100);
-    M5.Lcd.setTextSize(4);
-    M5.Lcd.println("STOLEN!");
-    M5.Speaker.beep(); // Annoy the thief
-}
-
-void resetDisplay() {
-    M5.Lcd.setCursor(10, 50);
-    M5.Lcd.setTextColor(GREEN, BLACK);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.println("Status: Stable");
+    // Update screen immediately
+    if (idle_score > PICKUP_THRESHOLD) {
+        M5.Display.fillScreen(TFT_RED);
+        M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.drawString("PUT IT DOWN!",
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 - 20);
+        String score = "conf: " + String(idle_score, 2);
+        M5.Display.drawString(score,
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 + 20);
+        M5.Speaker.tone(1000, 300);
+        Serial.println("*** ALARM ***");
+    } else {
+        M5.Display.fillScreen(TFT_DARKGREEN);
+        M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.drawString("FOCUSING",
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 - 20);
+        String score = "conf: " + String(stable_score, 2);
+        M5.Display.drawString(score,
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 + 20);
+    }
 }
