@@ -1,32 +1,31 @@
 #include <M5Unified.h>
-#include <WiFi.h>
+#include <esp_mac.h>
 
 void setup() {
+    Serial.begin(115200);
+
     auto cfg = M5.config();
     M5.begin(cfg);
 
-    // 1. Initialize the Wi-Fi radio (Required to read the MAC)
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(); 
+    delay(500);
 
-    // 2. Get the MAC Address string
-    String mac = WiFi.macAddress();
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
 
-    // 3. Print to Serial Monitor (for easy copy-pasting into your code)
-    Serial.begin(115200);
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     Serial.print("DEVICE MAC ADDRESS: ");
-    Serial.println(mac);
+    Serial.println(macStr);
 
-    // 4. Print to M5GO LCD Screen
     M5.Display.setTextSize(2);
     M5.Display.setCursor(10, 10);
     M5.Display.println("ESP-NOW MAC Finder");
     M5.Display.setCursor(10, 50);
     M5.Display.setTextColor(YELLOW);
     M5.Display.print("MAC: ");
-    M5.Display.println(mac);
+    M5.Display.println(macStr);
 }
 
-void loop() {
-    // Nothing to do here
-}
+void loop() {}
