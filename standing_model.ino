@@ -1,13 +1,27 @@
 #include <M5Unified.h>
-#include <guardyou_inferencing.h>
+#include <WiFi.h>
+#include <esp_now.h>
 #include <math.h>
 
-// ── TinyML ────────────────────────────────────────────────
-#define PICKUP_THRESHOLD 0.60f
-static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
-bool bufferReady     = false;
-bool phoneLifted     = false;
-bool lastPhoneLifted = false;
+// ── ESP-NOW MAC addresses ─────────────────────────────────
+uint8_t mac1[] = {0x2C, 0xBC, 0xBB, 0x94, 0x34, 0xC8};
+uint8_t mac2[] = {0x2C, 0xBC, 0xBB, 0x93, 0x7E, 0xC4};
+uint8_t peerAddress[6];
+
+// ── ESP-NOW data struct ───────────────────────────────────
+typedef struct struct_message {
+    int level;
+    bool taunt;
+} struct_message;
+
+struct_message myData;
+struct_message peerData;
+
+// ── State ─────────────────────────────────────────────────
+int myLevel             = 0;
+int friendLevel         = 0;
+bool friendLevelChanged = false;
+bool taunted            = false;
 
 // ── Timer state ───────────────────────────────────────────
 int lastRotation          = -1;
@@ -19,23 +33,31 @@ String currentLabel       = "";
 bool sessionCompleted     = false;
 
 // ── Pause state ───────────────────────────────────────────
-bool timerPaused          = false;
-unsigned long pausedAt    = 0;
+bool timerPaused            = false;
+unsigned long pausedAt      = 0;
 unsigned long totalPausedMs = 0;
 
 // ── Alarm buffer state ────────────────────────────────────
-bool inAlarmBuffer        = false;
+bool inAlarmBuffer             = false;
 unsigned long alarmBufferStart = 0;
 #define ALARM_BUFFER_MS   2500
-
-// ── Level system ──────────────────────────────────────────
-int myLevel               = 0;
-int friendLevel           = 0;
 
 // ── Colors ────────────────────────────────────────────────
 #define POKEBALL_RED    M5.Display.color565(220, 30,  30)
 #define POKEBALL_WHITE  M5.Display.color565(240, 240, 240)
 #define POKEBALL_BLACK  M5.Display.color565(20,  20,  20)
+
+// ── ESP-NOW receive callback ──────────────────────────────
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+    memcpy(&peerData, incomingData, sizeof(peerData));
+    Serial.printf("Received level %d taunt %d from peer\n", peerData.level, peerData.taunt);
+
+    if (peerData.taunt) {
+        taunted = true;
+    } else {
+        friendLevelChanged = true;
+    }
+}
 
 // ── Work mode check ───────────────────────────────────────
 bool isWorkMode() {
@@ -52,7 +74,7 @@ void drawPokeball(int cx, int cy, int r) {
     M5.Display.drawCircle(cx, cy, r, POKEBALL_BLACK);
 }
 
-// ── CHANGE 2: drawPokeballBar — no text, empty dark circles ──
+// ── Draw pokeball bar ─────────────────────────────────────
 void drawPokeballBar(int level, int corner) {
     int r       = 8;
     int spacing = 20;
@@ -62,7 +84,6 @@ void drawPokeballBar(int level, int corner) {
     int h = M5.Display.height();
 
     if (corner == 0) {
-        // Top right — clear area
         M5.Display.fillRect(w - (maxShow * spacing + 10), 2,
                             maxShow * spacing + 10, r * 2 + 6, TFT_BLACK);
         for (int i = 0; i < maxShow; i++) {
@@ -71,13 +92,11 @@ void drawPokeballBar(int level, int corner) {
             if (i < level) {
                 drawPokeball(cx, cy, r);
             } else {
-                // Empty slot — dark circle
                 M5.Display.fillCircle(cx, cy, r, M5.Display.color565(30, 30, 30));
                 M5.Display.drawCircle(cx, cy, r, M5.Display.color565(60, 60, 60));
             }
         }
     } else {
-        // Bottom left — clear area
         M5.Display.fillRect(0, h - (r * 2 + 14),
                             maxShow * spacing + 10, r * 2 + 14, TFT_BLACK);
         for (int i = 0; i < maxShow; i++) {
@@ -86,7 +105,6 @@ void drawPokeballBar(int level, int corner) {
             if (i < level) {
                 drawPokeball(cx, cy, r);
             } else {
-                // Empty slot — dark circle
                 M5.Display.fillCircle(cx, cy, r, M5.Display.color565(30, 30, 30));
                 M5.Display.drawCircle(cx, cy, r, M5.Display.color565(60, 60, 60));
             }
@@ -98,6 +116,28 @@ void drawPokeballBar(int level, int corner) {
 void drawBothBars() {
     drawPokeballBar(myLevel,     0);
     drawPokeballBar(friendLevel, 1);
+}
+
+// ── Draw taunt face ───────────────────────────────────────
+void drawTauntFace() {
+    M5.Display.fillScreen(M5.Display.color565(255, 165, 0));
+    int cx = M5.Display.width() / 2;
+    int cy = M5.Display.height() / 2;
+
+    // Eyes — smug squint
+    M5.Display.fillRect(cx - 55, cy - 30, 35, 15, TFT_BLACK);
+    M5.Display.fillRect(cx + 20, cy - 30, 35, 15, TFT_BLACK);
+
+    // Smug smile
+    M5.Display.fillArc(cx, cy + 20, 40, 30, 20, 160, TFT_BLACK);
+
+    M5.Display.setFont(&fonts::Font2);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_WHITE, M5.Display.color565(255, 165, 0));
+    M5.Display.drawString("TAUNTED!", cx, cy + 70);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("HAHA!", cx, cy + 95);
+    M5.Display.setTextSize(1);
 }
 
 // ── Draw angry face ───────────────────────────────────────
@@ -122,7 +162,7 @@ void drawAngryFace() {
     M5.Display.setFont(&fonts::Font2);
     M5.Display.setTextDatum(middle_center);
     M5.Display.setTextColor(TFT_WHITE, TFT_RED);
-
+    M5.Display.drawString("TIMER PAUSED!", cx, cy + 65);
     M5.Display.setTextSize(2);
     M5.Display.drawString("PUT IT DOWN!", cx, cy + 95);
     M5.Display.setTextSize(1);
@@ -171,13 +211,17 @@ void drawTimerScreen(long remainingSeconds, long totalSecs, bool forceRedraw) {
         sprintf(timeString, "%02d:%02d", displayMins, displaySecs);
 
         bool timerDone = (remainingSeconds == 0);
+
         if (timerDone && !sessionCompleted) {
             sessionCompleted = true;
             M5.Display.fillScreen(TFT_BLACK);
 
             if (currentLabel == "RELAX") {
                 myLevel++;
-                // CHANGE 1: volume 32
+                myData.level = myLevel;
+                myData.taunt = false;
+                esp_now_send(peerAddress, (uint8_t *)&myData, sizeof(myData));
+
                 M5.Speaker.setVolume(32);
                 M5.Speaker.tone(1200, 150);
                 delay(180);
@@ -208,7 +252,6 @@ void drawTimerScreen(long remainingSeconds, long totalSecs, bool forceRedraw) {
                 drawBothBars();
                 return;
             } else {
-                // CHANGE 1: volume 32
                 M5.Speaker.setVolume(32);
                 M5.Speaker.tone(800, 400);
             }
@@ -227,98 +270,146 @@ void drawTimerScreen(long remainingSeconds, long totalSecs, bool forceRedraw) {
     }
 }
 
-// ── TinyML sliding window inference ───────────────────────
-void runInference() {
-    size_t samples_required =
-        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
-
-    size_t quarter = (samples_required / 4) * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
-    memmove(buffer, buffer + quarter,
-            (EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE - quarter) * sizeof(float));
-
-    size_t fill_start = (samples_required * 3) / 4;
-    for (size_t i = fill_start; i < samples_required; i++) {
-        M5.Imu.update();
-        auto imu = M5.Imu.getImuData();
-        size_t ix = i * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
-        buffer[ix + 0] = imu.accel.x;
-        buffer[ix + 1] = imu.accel.y;
-        buffer[ix + 2] = imu.accel.z;
-        buffer[ix + 3] = imu.gyro.x;
-        buffer[ix + 4] = imu.gyro.y;
-        buffer[ix + 5] = imu.gyro.z;
-        delay(EI_CLASSIFIER_INTERVAL_MS);
-    }
-
-    signal_t signal;
-    numpy::signal_from_buffer(buffer,
-        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
-
-    ei_impulse_result_t result = { 0 };
-    run_classifier(&signal, &result, false);
-
-    float idle_score = 0.0f;
-    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        if (String(ei_classifier_inferencing_categories[i]) == "idle") {
-            idle_score = result.classification[i].value;
-        }
-    }
-
-    phoneLifted = (idle_score > PICKUP_THRESHOLD);
-}
-
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Imu.begin();
     Serial.begin(115200);
-
-    // CHANGE 1: volume 32
     M5.Speaker.setVolume(32);
 
+    // ── ESP-NOW init ──────────────────────────────────────
+    WiFi.mode(WIFI_STA);
+
+    uint8_t baseMac[6];
+    WiFi.macAddress(baseMac);
+    if (memcmp(baseMac, mac1, 6) == 0) {
+        memcpy(peerAddress, mac2, 6);
+    } else {
+        memcpy(peerAddress, mac1, 6);
+    }
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed");
+    } else {
+        esp_now_register_recv_cb(OnDataRecv);
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, peerAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+        Serial.println("ESP-NOW ready");
+
+        // ── Startup sync ──────────────────────────────────
+        delay(500);
+        myData.level = myLevel;
+        myData.taunt = false;
+        esp_now_send(peerAddress, (uint8_t *)&myData, sizeof(myData));
+    }
+
+    // ── Display init ──────────────────────────────────────
     M5.Display.setTextDatum(middle_center);
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setFont(&fonts::Font2);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.drawString("Loading AI...",
+    M5.Display.drawString("Peer M5Go Ready!",
         M5.Display.width() / 2,
         M5.Display.height() / 2);
-
-    size_t samples_required =
-        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
-
-    for (size_t i = 0; i < samples_required; i++) {
-        M5.Imu.update();
-        auto imu = M5.Imu.getImuData();
-        size_t ix = i * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
-        buffer[ix + 0] = imu.accel.x;
-        buffer[ix + 1] = imu.accel.y;
-        buffer[ix + 2] = imu.accel.z;
-        buffer[ix + 3] = imu.gyro.x;
-        buffer[ix + 4] = imu.gyro.y;
-        buffer[ix + 5] = imu.gyro.z;
-        delay(EI_CLASSIFIER_INTERVAL_MS);
-    }
-
-    bufferReady = true;
+    delay(1500);
     M5.Display.fillScreen(TFT_BLACK);
 }
 
 void loop() {
     M5.update();
 
-    // CHANGE 3: reset button — BtnA is left button on M5Go
+    // ── BtnA — reset level ────────────────────────────────
     if (M5.BtnA.wasPressed()) {
-        myLevel = 0;
+        myLevel      = 0;
+        myData.level = myLevel;
+        myData.taunt = false;
+        esp_now_send(peerAddress, (uint8_t *)&myData, sizeof(myData));
         drawBothBars();
     }
 
-    // ── 1. Inference ──────────────────────────────────────
-    if (bufferReady) {
-        runInference();
+    // ── BtnB — manual level up ────────────────────────────
+    if (M5.BtnB.wasPressed()) {
+        myLevel++;
+        myData.level = myLevel;
+        myData.taunt = false;
+        esp_now_send(peerAddress, (uint8_t *)&myData, sizeof(myData));
+
+        M5.Speaker.setVolume(32);
+        M5.Speaker.tone(1200, 150);
+        delay(180);
+        M5.Speaker.tone(1500, 150);
+        delay(180);
+        M5.Speaker.tone(1800, 300);
+
+        M5.Display.setFont(&fonts::Font4);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.drawString("LEVEL UP!",
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 - 20);
+        M5.Display.setFont(&fonts::Font2);
+        M5.Display.drawString("Lv " + String(myLevel),
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 + 20);
+        delay(1500);
+
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setFont(&fonts::Font2);
+        M5.Display.setTextColor(themeColor, TFT_BLACK);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.drawString(currentLabel,
+            M5.Display.width() / 2,
+            M5.Display.height() / 2 - 55);
+        lastRemainingSeconds = -1;
+        drawBothBars();
     }
 
-    // ── 2. Orientation ────────────────────────────────────
+    // ── BtnC — send taunt ─────────────────────────────────────
+if (M5.BtnC.wasPressed()) {
+    myData.level = myLevel;
+    myData.taunt = true;
+    esp_now_send(peerAddress, (uint8_t *)&myData, sizeof(myData));
+    myData.taunt = false;
+
+    // NO local sound — the peer plays the sound on their end
+    Serial.println("Taunt sent!");
+}
+    // ── Friend level update ───────────────────────────────
+    if (friendLevelChanged) {
+        friendLevel        = peerData.level;
+        friendLevelChanged = false;
+        drawPokeballBar(friendLevel, 1);
+    }
+
+    // ── Taunt received ────────────────────────────────────
+    if (taunted) {
+        taunted = false;
+        drawTauntFace();
+        M5.Speaker.setVolume(32);
+        M5.Speaker.tone(400, 200);
+        delay(220);
+        M5.Speaker.tone(300, 400);
+        delay(2000);
+
+        // restore screen
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setFont(&fonts::Font2);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setTextColor(themeColor, TFT_BLACK);
+        if (currentLabel != "") {
+            M5.Display.drawString(currentLabel,
+                M5.Display.width() / 2,
+                M5.Display.height() / 2 - 55);
+        }
+        lastRemainingSeconds = -1;
+        drawBothBars();
+    }
+
+    // ── Orientation ───────────────────────────────────────
     M5.Imu.update();
     auto ImuData = M5.Imu.getImuData();
     float ax = ImuData.accel.x;
@@ -344,12 +435,11 @@ void loop() {
         timerPaused      = false;
         inAlarmBuffer    = false;
         sessionCompleted = false;
-        lastPhoneLifted  = !phoneLifted;
         M5.Display.setRotation(currentRotation);
         drawTimerScreen(timerMinutes * 60, timerMinutes * 60, true);
     }
 
-    // ── 3. Alarm buffer expiry ────────────────────────────
+    // ── Alarm buffer expiry ───────────────────────────────
     if (inAlarmBuffer && (millis() - alarmBufferStart >= ALARM_BUFFER_MS)) {
         inAlarmBuffer  = false;
         totalPausedMs += ALARM_BUFFER_MS;
@@ -366,41 +456,7 @@ void loop() {
         drawBothBars();
     }
 
-    // ── 4. Pause / resume ─────────────────────────────────
-    if (isWorkMode() && !inAlarmBuffer) {
-        bool justLifted   = phoneLifted && !lastPhoneLifted;
-        bool justReturned = !phoneLifted && lastPhoneLifted;
-
-        if (justLifted && !timerPaused) {
-            timerPaused      = true;
-            pausedAt         = millis();
-            inAlarmBuffer    = true;
-            alarmBufferStart = millis();
-            drawAngryFace();
-            // CHANGE 1: volume 32
-            M5.Speaker.setVolume(32);
-            M5.Speaker.tone(1000, 300);
-        }
-
-        if (justReturned && timerPaused && !inAlarmBuffer) {
-            totalPausedMs += (millis() - pausedAt);
-            timerPaused    = false;
-
-            M5.Display.fillScreen(TFT_BLACK);
-            M5.Display.setFont(&fonts::Font2);
-            M5.Display.setTextDatum(middle_center);
-            M5.Display.setTextColor(themeColor, TFT_BLACK);
-            M5.Display.drawString(currentLabel,
-                M5.Display.width() / 2,
-                M5.Display.height() / 2 - 55);
-            lastRemainingSeconds = -1;
-            drawBothBars();
-        }
-    }
-
-    lastPhoneLifted = phoneLifted;
-
-    // ── 5. Timer math ─────────────────────────────────────
+    // ── Timer math ────────────────────────────────────────
     long totalSecs = timerMinutes * 60;
     unsigned long effectiveElapsed = millis() - startTime - totalPausedMs;
 
@@ -411,7 +467,7 @@ void loop() {
     long remainingSeconds = totalSecs - (long)(effectiveElapsed / 1000);
     if (remainingSeconds < 0) remainingSeconds = 0;
 
-    // ── 6. Draw ───────────────────────────────────────────
+    // ── Draw ──────────────────────────────────────────────
     if (lastRotation != -1 && !timerPaused && !inAlarmBuffer) {
         drawTimerScreen(remainingSeconds, totalSecs, false);
     }
