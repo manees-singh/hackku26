@@ -31,9 +31,9 @@ void loop(void) {
     int minutes = 0;
 
     // 1. Orientation Detection
-    if (ay > 0.5)      { currentRotation = 1; label = "RELAX";     minutes = 2;  } 
+    if (ay > 0.5)      { currentRotation = 1; label = "FOCUS";     minutes = 25;  } 
     else if (ay < -0.5) { currentRotation = 3; label = "BREAK";     minutes = 5;  } 
-    else if (ax > 0.5)  { currentRotation = 2; label = "FOCUS";     minutes = 25; } 
+    else if (ax > 0.5)  { currentRotation = 2; label = "RELAX";     minutes = 2; } 
     else if (ax < -0.5) { currentRotation = 0; label = "DEEP WORK"; minutes = 45; }
 
     // 2. Only Redraw everything on a Flip
